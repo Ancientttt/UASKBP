@@ -1,0 +1,229 @@
+#include <mpi.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <float.h>
+
+#define MASTER 0
+#define MAX_LINE 256
+
+int read_csv_values(const char *filename, double **values_out) {
+    FILE *file = fopen(filename, "r");
+    if (!file) {
+        perror("Gagal membuka file CSV");
+        return -1;
+    }
+
+    int capacity = 128;
+    int count = 0;
+    double *values = (double *) malloc(capacity * sizeof(double));
+
+    if (!values) {
+        fclose(file);
+        fprintf(stderr, "Gagal alokasi memori\n");
+        return -1;
+    }
+
+    char line[MAX_LINE];
+
+    // Lewati header: NIM,Nilai
+    if (fgets(line, sizeof(line), file) == NULL) {
+        free(values);
+        fclose(file);
+        *values_out = NULL;
+        return 0;
+    }
+
+    while (fgets(line, sizeof(line), file)) {
+        char *nim = strtok(line, ",");
+        char *nilai_str = strtok(NULL, ",\n\r");
+
+        if (nim == NULL || nilai_str == NULL) {
+            continue;
+        }
+
+        double nilai = atof(nilai_str);
+
+        if (count >= capacity) {
+            capacity *= 2;
+            double *temp = (double *) realloc(values, capacity * sizeof(double));
+
+            if (!temp) {
+                free(values);
+                fclose(file);
+                fprintf(stderr, "Gagal realloc memori\n");
+                return -1;
+            }
+
+            values = temp;
+        }
+
+        values[count++] = nilai;
+    }
+
+    fclose(file);
+    *values_out = values;
+    return count;
+}
+
+int main(int argc, char **argv) {
+    int rank, size;
+    char hostname[MPI_MAX_PROCESSOR_NAME];
+    int hostname_len;
+
+    MPI_Init(&argc, &argv);
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+    MPI_Get_processor_name(hostname, &hostname_len);
+
+    double *all_values = NULL;   // hanya valid di MASTER
+    int *send_counts   = NULL;   // hanya valid di MASTER
+    int *displs        = NULL;   // hanya valid di MASTER
+    int total_data     = 0;
+
+    // ---------------------------------------------------------
+    // 1) MASTER membaca CSV dan menghitung pembagian data
+    //    (pakai Scatterv karena total data belum tentu habis
+    //     dibagi rata ke seluruh proses)
+    // ---------------------------------------------------------
+    if (rank == MASTER) {
+        total_data = read_csv_values("data_nilai.csv", &all_values);
+
+        if (total_data <= 0) {
+            fprintf(stderr, "Error: data_nilai.csv kosong atau tidak bisa dibaca\n");
+            free(all_values);
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
+
+        send_counts = (int *) malloc(size * sizeof(int));
+        displs      = (int *) malloc(size * sizeof(int));
+
+        int base      = total_data / size;
+        int remainder = total_data % size;
+        int offset    = 0;
+
+        for (int i = 0; i < size; i++) {
+            send_counts[i] = base + (i < remainder ? 1 : 0);
+            displs[i] = offset;
+            offset += send_counts[i];
+        }
+    }
+
+    // ---------------------------------------------------------
+    // 2) Setiap proses (termasuk MASTER) harus tahu berapa
+    //    banyak elemen yang akan ia terima -> MPI_Scatter
+    //    (mengirim 1 angka int ke tiap rank)
+    // ---------------------------------------------------------
+    int local_count;
+    MPI_Scatter(send_counts, 1, MPI_INT,
+                &local_count, 1, MPI_INT,
+                MASTER, MPI_COMM_WORLD);
+
+    double *local_values = NULL;
+    if (local_count > 0) {
+        local_values = (double *) malloc(local_count * sizeof(double));
+    }
+
+    // ---------------------------------------------------------
+    // 3) Distribusi data nilai sesungguhnya -> MPI_Scatterv
+    //    (pengganti loop MPI_Send manual di versi sebelumnya)
+    // ---------------------------------------------------------
+    MPI_Scatterv(all_values, send_counts, displs, MPI_DOUBLE,
+                 local_values, local_count, MPI_DOUBLE,
+                 MASTER, MPI_COMM_WORLD);
+
+    // ---------------------------------------------------------
+    // 4) Setiap proses (termasuk MASTER) menghitung statistik
+    //    lokal dari bagian datanya sendiri
+    // ---------------------------------------------------------
+    double local_max = -DBL_MAX;
+    double local_min = DBL_MAX;
+    double local_sum = 0.0;
+
+    for (int i = 0; i < local_count; i++) {
+        if (local_values[i] > local_max) local_max = local_values[i];
+        if (local_values[i] < local_min) local_min = local_values[i];
+        local_sum += local_values[i];
+    }
+
+    // ---------------------------------------------------------
+    // 5) Reduksi hasil seluruh proses ke MASTER -> MPI_Reduce
+    //    (pengganti loop MPI_Recv + perhitungan manual)
+    // ---------------------------------------------------------
+    double global_max = 0.0, global_min = 0.0, global_sum = 0.0;
+    int processed_count = 0;
+
+    MPI_Reduce(&local_max, &global_max, 1, MPI_DOUBLE, MPI_MAX, MASTER, MPI_COMM_WORLD);
+    MPI_Reduce(&local_min, &global_min, 1, MPI_DOUBLE, MPI_MIN, MASTER, MPI_COMM_WORLD);
+    MPI_Reduce(&local_sum, &global_sum, 1, MPI_DOUBLE, MPI_SUM, MASTER, MPI_COMM_WORLD);
+    MPI_Reduce(&local_count, &processed_count, 1, MPI_INT, MPI_SUM, MASTER, MPI_COMM_WORLD);
+
+    // ---------------------------------------------------------
+    // 6) Kumpulkan hostname & jumlah data tiap rank -> MPI_Gather
+    //    (sekedar untuk laporan info proses, bukan bagian inti
+    //     dari analisis data)
+    // ---------------------------------------------------------
+    char *all_hostnames = NULL;
+    int  *all_counts    = NULL;
+
+    if (rank == MASTER) {
+        all_hostnames = (char *) malloc(size * MPI_MAX_PROCESSOR_NAME * sizeof(char));
+        all_counts    = (int  *) malloc(size * sizeof(int));
+    }
+
+    MPI_Gather(hostname, MPI_MAX_PROCESSOR_NAME, MPI_CHAR,
+               all_hostnames, MPI_MAX_PROCESSOR_NAME, MPI_CHAR,
+               MASTER, MPI_COMM_WORLD);
+
+    MPI_Gather(&local_count, 1, MPI_INT,
+               all_counts, 1, MPI_INT,
+               MASTER, MPI_COMM_WORLD);
+
+    // ---------------------------------------------------------
+    // 7) MASTER menampilkan hasil akhir
+    // ---------------------------------------------------------
+    if (rank == MASTER) {
+        if (processed_count == 0) {
+            fprintf(stderr, "Error: Tidak ada data yang berhasil diproses\n");
+            free(all_values);
+            free(send_counts);
+            free(displs);
+            free(all_hostnames);
+            free(all_counts);
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
+
+        double average = global_sum / processed_count;
+
+        printf("===========================================\n");
+        printf("INFO PROSES & HOSTNAME (MPI)\n");
+        printf("===========================================\n");
+        for (int i = 0; i < size; i++) {
+            printf("Rank %-2d %-9s : %s  (jumlah data: %d)\n",
+                   i, (i == MASTER ? "(Master)" : "(Worker)"),
+                   all_hostnames + (i * MPI_MAX_PROCESSOR_NAME),
+                   all_counts[i]);
+        }
+
+        printf("===========================================\n");
+        printf("HASIL ANALISIS NILAI MAHASISWA (MPI)\n");
+        printf("===========================================\n");
+        printf("Jumlah Proses MPI   : %d proses\n", size);
+        printf("Total Data Diproses : %d baris\n", processed_count);
+        printf("Nilai Tertinggi     : %.2f\n", global_max);
+        printf("Nilai Terendah      : %.2f\n", global_min);
+        printf("Rata-rata Kelas     : %.2f\n", average);
+        printf("===========================================\n");
+
+        free(all_values);
+        free(send_counts);
+        free(displs);
+        free(all_hostnames);
+        free(all_counts);
+    }
+
+    free(local_values);
+
+    MPI_Finalize();
+    return 0;
+}
